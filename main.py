@@ -26,10 +26,14 @@ class RestrictedAreaDetector:
         )
         
         # İhlal parametreleri
-        self.breach_threshold = 0.10  # %10 hareket = ihlal
+        self.breach_threshold = 0.15  # %15 hareket = ihlal (daha sıkı)
         self.breach_frames = 0  # Ardışık ihlal frame sayısı
-        self.breach_frames_required = 4  # 4 frame = hızlı ama kararlı
+        self.breach_frames_required = 6  # 6 frame = daha kararlı tespit
         self.current_motion_ratio = 0.0  # Anlık hareket oranı
+        
+        # Profesyonel tespit için
+        self.prev_frame_gray = None  # Frame differencing için
+        self.min_contour_area = 800  # Minimum nesne boyutu (piksel) - daha büyük
         
         # Pencere ayarları
         self.window_name = 'Restricted Area Breach Detector'
@@ -161,6 +165,7 @@ class RestrictedAreaDetector:
         self.selecting = False
         self.breach_detected = False
         self.breach_frames = 0
+        self.prev_frame_gray = None  # Frame diff'i sıfırla
         if was_breached:
             print("[+] Alarm reset - system ready")
         else:
@@ -177,42 +182,80 @@ class RestrictedAreaDetector:
             print("[+] Fullscreen OFF")
     
     def detect_motion_in_area(self, frame):
-        """Korunan alanda hareket tespit et"""
+        """Profesyonel hareket tespiti - Multi-method detection"""
         if not self.protected_area:
             return False
         
         x, y, w, h = self.protected_area
+        roi = frame[y:y+h, x:x+w]
         
-        # Background subtraction uygula (learningRate düşük = yavaş hareketleri yakala)
-        fg_mask = self.bg_subtractor.apply(frame, learningRate=0.0005)  # Çok yavaş öğrenme
+        # Gray scale dönüşümü
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Hafif gürültü azaltma (daha az filtreleme = daha hassas)
-        kernel = np.ones((2, 2), np.uint8)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
-        
-        # Sadece korunan alandaki maskeyi al
+        # METHOD 1: Background Subtraction
+        fg_mask = self.bg_subtractor.apply(frame, learningRate=0.0005)
         roi_mask = fg_mask[y:y+h, x:x+w]
         
-        # Hareket eden piksel sayısı
+        # METHOD 2: Frame Differencing (ardışık frame karşılaştırma)
+        frame_diff_detected = False
+        if self.prev_frame_gray is not None and self.prev_frame_gray.shape == gray.shape:
+            frame_diff = cv2.absdiff(self.prev_frame_gray, gray)
+            _, frame_diff_thresh = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)
+            frame_diff_detected = cv2.countNonZero(frame_diff_thresh) > (w * h * 0.05)
+        
+        self.prev_frame_gray = gray.copy()
+        
+        # Morfolojik operasyonlar (gürültü temizleme)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        roi_mask = cv2.morphologyEx(roi_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Contour detection (gerçek nesneleri bul)
+        contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Büyük contourları say
+        significant_contours = 0
+        for contour in contours:
+            if cv2.contourArea(contour) > self.min_contour_area:
+                significant_contours += 1
+        
+        # Hareket oranı hesapla
         motion_pixels = cv2.countNonZero(roi_mask)
         total_pixels = w * h
         motion_ratio = motion_pixels / total_pixels if total_pixels > 0 else 0
-        
-        # Debug: Hareket oranını sakla (ekranda göstermek için)
         self.current_motion_ratio = motion_ratio
         
+        # TRIPLE VERIFICATION: Üç kriterden en az ikisi sağlanmalı
+        criteria_met = 0
+        
+        # Kriter 1: Contour + Motion ratio
+        if significant_contours > 0 and motion_ratio > self.breach_threshold:
+            criteria_met += 1
+        
+        # Kriter 2: Frame difference + Motion ratio
+        if frame_diff_detected and motion_ratio > self.breach_threshold * 0.8:
+            criteria_met += 1
+        
+        # Kriter 3: Yüksek motion ratio (güçlü hareket)
+        if motion_ratio > self.breach_threshold * 1.5:
+            criteria_met += 1
+        
+        # En az 2 kriter sağlanmalı
+        motion_detected = criteria_met >= 2
+        
         # İhlal kontrolü
-        if motion_ratio > self.breach_threshold:
+        if motion_detected:
             self.breach_frames += 1
             if self.breach_frames >= self.breach_frames_required:
                 self.breach_detected = True
                 return True
         else:
-            # Hareket yoksa sayacı azalt ve alarm otomatik kapansın
+            # Hareket yoksa sayacı azalt
             if self.breach_frames > 0:
                 self.breach_frames = max(0, self.breach_frames - 1)
             
-            # Alarm otomatik kapanır (hareket bitince)
+            # Alarm otomatik kapanır
             if self.breach_frames == 0:
                 self.breach_detected = False
         
