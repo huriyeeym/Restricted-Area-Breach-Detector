@@ -251,11 +251,11 @@ class RestrictedAreaDetector:
                 self.breach_detected = True
                 return True
         else:
-            # Hareket yoksa sayacı azalt
+            # Hareket yoksa sayacı HIZLI azalt (3x hızlı kapanma)
             if self.breach_frames > 0:
-                self.breach_frames = max(0, self.breach_frames - 1)
+                self.breach_frames = max(0, self.breach_frames - 3)
             
-            # Alarm otomatik kapanır
+            # Alarm otomatik kapanır (hızlı)
             if self.breach_frames == 0:
                 self.breach_detected = False
         
